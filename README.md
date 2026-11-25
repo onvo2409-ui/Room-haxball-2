@@ -151,7 +151,7 @@ GEO[k] = deriveDims(DIMS[MODE_INFO[k].dim], 2);
 }
 
 const BALL_RADIUS = 5.8;     // chỉ số DUY NHẤT khác mặc định HaxBall (mặc định là 10)
-const WALL_BCOEF = 1.12;  // tường: 0.5 × 1.24 = nảy 0.62
+const WALL_BCOEF = 1;  // tường: 0.5 × 1.24 = nảy 0.62
 const POST_BCOEF = 1.24;  // cột gôn: cũng 0.62 cho đồng bộ (hoặc để 1.25 như trước, chênh không đáng kể)
 const DEFAULT_PLAYER = { radius: 15, invMass: 0.5, damping: 0.96, acceleration: 0.11,
                          kickingAcceleration: 0.07, kickingDamping: 0.96,
@@ -257,7 +257,6 @@ return { get data() { return data; }, load, save, touch() { dirty = true; }, flu
 })();
 
 Store.load();
-
 /* ═══════════════════ 5. KHỞI TẠO PHÒNG & TRẠNG THÁI ═══════════════════ */
 
 if (!CONFIG.PASSWORDS.SUPER) CONFIG.PASSWORDS.SUPER = genPass(12);
@@ -595,10 +594,10 @@ function dropLeastContributor(t, why) {
     const cap = S.lineup.cap[t], order = S.lineup.order[t];
     const cands = tm(t).filter(id => id !== cap && valid(id));
     if (!cands.length) return false;
-    const score = id => {                                           // ưu tiên đóng góp trong trận ĐANG diễn ra, không có thì lấy ván vừa rồi
-        const a = (rec(id) || {}).auth, m = S.match && S.match.pl && S.match.pl[a];
-        return m ? (m.g || 0) + (m.a || 0) - (m.og || 0) : (S.lastContrib[a] || 0);
-    };
+const score = id => {
+    const a = (rec(id) || {}).auth, m = S.match && S.match.pl && S.match.pl[a];
+    return m ? matchPoints(m) : (S.lastContrib[a] || 0);
+};
     cands.sort((a, b) => score(a) - score(b) || order.indexOf(b) - order.indexOf(a) || rec(b).joinedAt - rec(a).joinedAt);
     const v = cands[0];
     say(`⚖️ Đội ${tname(t)} thừa người, ${why || "hàng chờ trống"} — ${rec(v).name} (đóng góp ${score(v)}, thấp nhất) ra hàng chờ để cân đội.`, C.warn, "bold");
@@ -1086,7 +1085,7 @@ function handleMatchEnd() {
         S.paused = false;
         const aborted = !S.result;                       // trận bị dừng giữa chừng (người thoát / admin / restart)
         S.lastContrib = {};                              // chụp điểm đóng góp TRƯỚC khi commitMatch xóa S.match
-        for (const [auth, x] of Object.entries((S.match && S.match.pl) || {})) S.lastContrib[auth] = (x.g || 0) + (x.a || 0) - (x.og || 0);
+for (const [auth, x] of Object.entries((S.match && S.match.pl) || {})) S.lastContrib[auth] = matchPoints(x);
         commitMatch();
         if (Object.keys(S.bets.winner).length) refundBets();
         const res = S.result; S.result = null;
@@ -1165,7 +1164,7 @@ function startShootout() {
     if (S.pen || !running() || !S.match || S.result || S.mode === "practice") return false;
     const sc = room.getScores(); if (!sc) return false;
     const roster = { 1: tm(1).filter(valid), 2: tm(2).filter(valid) };
-    const contrib = id => { const m = S.match.pl[(rec(id) || {}).auth]; return m ? (m.g || 0) + (m.a || 0) - (m.og || 0) : 0; };
+    const contrib = id => matchPoints(S.match.pl[(rec(id) || {}).auth]);
     const order = t => roster[t].slice().sort((x, y) => contrib(y) - contrib(x));   // người cuối = thủ môn
 const box = PEN_BOX[mapKeyOf(S.mode)], geo0 = GEO[mapKeyOf(S.mode)] || GEO["2v2"];
 const goalX = t => (t === 1 ? -1 : 1) * (box ? box.gx : geo0.W);   // đỏ chốt lưới bên trái, xanh bên phải
@@ -1417,7 +1416,110 @@ return restartRound();        }
     const r = teamIds(1).length, b = teamIds(2).length;
 if (r === 0 || b === 0) return restartRound();
     if (r !== b) unrate("số người 2 đội không bằng nhau");
-}                                                                                             function moveAfk(p, reason) {
+}  
+/* ═══════ ĐIỂM ĐÓNG GÓP  ═══════ */
+const PTS = { g: 5, a: 2, og: -3, pass: 1, sot: 0.5, ss: 2, err: -2, atog: 2, touch: 0.001 };
+const GOAL_DIM = {
+  "1v1": { x: 368, y: 50 }, "2v2": { x: 400, y: 70 },
+  "3v3": { x: 665, y: 80 }, "5v5": { x: 773, y: 100 },
+};
+const matchPoints = x => { if (!x) return 0; let s = 0; for (const k in PTS) s += PTS[k] * (x[k] || 0); return s; };
+
+function bump(p, key, n = 1) {
+  const M = S.match; if (!M || !p) return;
+  const x = M.pl[p.auth] || (M.pl[p.auth] = { name: p.name, g: 0, a: 0, og: 0 });
+  x[key] = (x[key] || 0) + n;
+}
+
+S.kicks = [];
+function trackKick(pl) {
+  if (!S.match || S.mode === "practice" || S.pen || !pl.team) return;
+  const gd = GOAL_DIM[mapKeyOf(S.mode)], b = room.getDiscProperties(0);
+  if (!gd || !b) return;
+  const me = rec(pl.id); if (!me) return;
+  const goalX = pl.team === 1 ? gd.x : -gd.x;
+  const shot = goalX * b.xspeed > 0 &&
+    Math.abs(b.x + b.xspeed * 97.5) > gd.x &&
+    Math.abs(b.y + b.yspeed * (goalX - b.x) / b.xspeed) < gd.y;
+  const prev = S.kicks[0];
+  S.kicks.unshift({ id: pl.id, team: pl.team, x: b.x, y: b.y, shot });
+  if (S.kicks.length > 3) S.kicks.pop();
+  if (!prev) return;
+  const dist = Math.hypot(b.x - prev.x, b.y - prev.y), pp = rec(prev.id);
+  if (prev.id !== pl.id) bump(me, "touch");
+  if (shot) bump(me, "sot");
+  if (prev.team !== pl.team) {
+    if (prev.shot) { bump(me, "ss"); if (dist < 30) { bump(pp, "sot", -1); prev.shot = false; } }
+  } else if (prev.id !== pl.id && dist > 12) bump(pp, "pass");
+}
+
+function motmOf(m, res) {
+  const teamOf = {};
+  for (const p of list()) if (p.team) teamOf[rec(p.id).auth] = p.team;
+  let best = null;
+  for (const [auth, x] of Object.entries(m.pl)) {
+    const v = matchPoints(x) + (res && teamOf[auth] === res.winner ? 1 : 0);
+    if (v > 0 && (!best || v > best[1])) best = [auth, v];
+  }
+  return best;
+}
+
+/* ═══════ NGƯỜI VÀO THAY ═══════ */
+const SUB_RULE = { ENABLED: true, MIN_POINTS: 3 };
+function isLowSub(m, auth) {
+  if (!SUB_RULE.ENABLED || !m || !m.starters || m.starters[auth]) return false;
+  return matchPoints(m.pl && m.pl[auth]) < SUB_RULE.MIN_POINTS;
+}
+
+/* ═══════ TÍNH KẾT QUẢ CHO NGƯỜI THOÁT / AFK ═══════ */
+const ELO_LEAVE = { ENABLED: true, K: 24, DRAW_PENALTY: 6, WIN_PENALTY: 8, COMP: 0, GRACE_MS: 30e3, AFK_ADMIN: false };
+
+function eloLeavePenalty(team, p, kind) {
+  const Kc = ELO_LEAVE, m = S.match;
+  if (!Kc.ENABLED || !team || !m || !m.rated) return;
+  if (!running() || S.result || S.pen || S.mode === "practice") return;
+  if (kind === "AFK_ADMIN" && !Kc.AFK_ADMIN) return;
+  if (Now() - (m.t0 || 0) < Kc.GRACE_MS) return;
+  m.quit = m.quit || {};
+  if (m.quit[p.auth]) return;
+  if (isLowSub(m, p.auth)) return;
+  const sc = room.getScores();
+  if (!sc || sc.time < CONFIG.MIN_RATED_SECONDS) return;
+
+  const mine = sc[team === 1 ? "red" : "blue"], theirs = sc[team === 1 ? "blue" : "red"];
+  const s = stat(p.auth, p.name), ec = econ(p.auth, p.name);
+  const why = kind === "QUIT" ? "thoát" : "AFK";
+  const before = s.rating;
+  let delta = 0, line;
+
+  if (mine < theirs) {
+    const avg = ids => ids.length ? ids.reduce((a, id) => { const r = rec(id); return a + (r ? stat(r.auth, r.name).rating : 1000); }, 0) / ids.length : 1000;
+    const mates = teamIds(team).filter(id => id !== p.id && valid(id));
+    const foes = teamIds(3 - team).filter(valid);
+    const eMine = 1 / (1 + Math.pow(10, (avg(foes) - avg([...mates, p.id])) / 400));
+    delta = -Math.max(1, Math.round(Kc.K * eMine));
+    if (ec.eloGuard) { delta = 0; ec.eloGuard = false; tell(p.id, "🛡️ Bảo hộ ELO đã dùng: không bị trừ điểm!", C.info, "bold"); }
+    s.games++; s.losses++; s.streak = 0;
+    line = `📉 ${p.name} ${why} khi đội đang thua ${mine}-${theirs} → tính THUA, ${delta} Elo`;
+  } else {
+    delta = -(mine === theirs ? Kc.DRAW_PENALTY : Kc.WIN_PENALTY);
+    s.streak = 0;
+    line = `📉 ${p.name} ${why} giữa trận (${mine}-${theirs}) → phạt ${delta} Elo`;
+  }
+  s.leaves = (s.leaves || 0) + 1;
+  s.rating = Math.max(0, s.rating + delta);
+  m.quit[p.auth] = true;
+  say(`${line} (${s.rating}).`, C.warn, "bold");
+
+  if (Kc.COMP > 0 && before > s.rating)
+    for (const id of teamIds(team).filter(i => i !== p.id && valid(i))) {
+      const r = rec(id); if (!r) continue;
+      const ms = stat(r.auth, r.name); ms.rating += Kc.COMP;
+      tell(id, `🤝 ${p.name} bỏ trận — bạn được bù +${Kc.COMP} Elo (${ms.rating}).`, C.ok, "bold");
+    }
+  Store.touch();
+  if (S.players.has(p.id)) checkAndApplyEloRank(p, false);
+}                                                                                           function moveAfk(p, reason, kind = "AFK_AUTO") {
     const pl0 = room.getPlayer(p.id), was = pl0 ? pl0.team : 0;      // lưu đội TRƯỚC khi đẩy ra
     p.afk = true; p.afkSince = Now(); p.afkWarned = false;
     removePlayerBuff(p.id);
@@ -1425,7 +1527,8 @@ if (r === 0 || b === 0) return restartRound();
     syncQueue();
     tell(p.id, `💤 ${reason}. Gõ !back để quay lại hàng chờ.`, C.warn, "bold", 2);
     say(`💤 ${p.name} bị chuyển sang AFK.`, C.sys, "small");
-    repPenalty({ team: was }, p, "AFK giữa trận");                  // ← THÊM
+    repPenalty({ team: was }, p, "AFK giữa trận");
+       eloLeavePenalty(was, p, kind); 
     if (S.picking.active) onPickChange(p.id);
     else if (was && S.mode !== "practice" && !S.pen && (running() || S.recovery))
         onTeamMemberLeftMidMatch({ id: p.id, team: was }, p);
@@ -1851,17 +1954,20 @@ Store.touch();
 if (!res || res.time < CONFIG.MIN_RATED_SECONDS) return;
 
 let motmAuth = null, motmGoals = 0;
-for (const [auth, x] of Object.entries(m.pl)) if (x.g > motmGoals) { motmGoals = x.g; motmAuth = auth; }
-if (motmAuth && motmGoals > 0) {
-const e = econ(motmAuth, m.pl[motmAuth].name);
-e.coins += 300; Store.touch();
-const motmPlayer = list().find(p => rec(p.id).auth === motmAuth);
-if (motmPlayer) tell(motmPlayer.id, "🌟 Bạn là MOTM! +300 xu thưởng.", C.super, "bold", 1);
+{
+  const mo = motmOf(m, res);
+  if (mo) {
+    motmAuth = mo[0]; motmGoals = m.pl[motmAuth].g || 0;
+    say(`🌟 MOTM: ${m.pl[motmAuth].name} (${mo[1].toFixed(1)} điểm)`, C.super, "bold");
+    const e = econ(motmAuth, m.pl[motmAuth].name);
+    e.coins += 300; Store.touch();
+    const mp = list().find(p => rec(p.id).auth === motmAuth);
+    if (mp) tell(mp.id, "🌟 Bạn là MOTM! +300 xu thưởng.", C.super, "bold", 1);
+  }
 }
-
-const team = { 1: list().filter(p => p.team === 1), 2: list().filter(p => p.team === 2) };
+const done = p => m.quit && m.quit[rec(p.id).auth];
+const team = { 1: list().filter(p => p.team === 1 && !done(p)), 2: list().filter(p => p.team === 2 && !done(p)) };
 if (!team[1].length || !team[2].length) return;
-
 const avg = t => team[t].reduce((a, p) => a + stat(rec(p.id).auth, p.name).rating, 0) / team[t].length;
 const ra = avg(1), rb = avg(2), K = res.pen ? 12 : 24;
 const e1 = 1 / (1 + Math.pow(10, (rb - ra) / 400));
@@ -1870,6 +1976,7 @@ const gain = Math.max(1, Math.round(K * (1 - eWin)));
 
 const streakUp = {}, streakEnd = {}, lines = [];
 for (const t of [1, 2]) for (const p of team[t]) {
+if (isLowSub(m, rec(p.id).auth)) { tell(p.id, "ℹ️ Bạn vào thay giữa trận và đóng góp ít — không cộng/trừ Elo trận này.", C.info); continue; }
 const s = stat(rec(p.id).auth, p.name), won = t === win;
 const pr = rec(p.id), ec = econ(pr.auth, pr.name);
 let delta = won ? gain : -gain;
@@ -2148,12 +2255,16 @@ return table[table.length - 1];
 }
 
 const CODE_POOL = [
-{ label: "1.000 xu", apply: e => e.coins += 1000 }, { label: "5.000 xu", apply: e => e.coins += 5000 },
-{ label: "20.000 xu", apply: e => e.coins += 20000 }, { label: "1 ruby", apply: e => e.ruby += 1 },
-{ label: "5 ruby", apply: e => e.ruby += 5 }, { label: "1x Rương Thường", apply: e => e.boxes.common++ },
-{ label: "1x Rương Sử Thi", apply: e => e.boxes.epic++ },
+  { label: "1.000 xu",  t: "coins", n: 1000 }, { label: "5.000 xu",  t: "coins", n: 5000 },
+  { label: "20.000 xu", t: "coins", n: 20000 }, { label: "1 ruby", t: "ruby", n: 1 },
+  { label: "5 ruby",    t: "ruby", n: 5 },     { label: "1x Rương Thường", t: "box", n: 1, b: "common" },
+  { label: "1x Rương Sử Thi", t: "box", n: 1, b: "epic" },
 ];
-
+function applyReward(e, r) {
+  if (r.t === "coins") e.coins += r.n;
+  else if (r.t === "ruby") e.ruby += r.n;
+  else if (r.t === "box") e.boxes[r.b] = (e.boxes[r.b] || 0) + r.n;
+}
 function adminCreateCode(name) {
 const picks = [...CODE_POOL].sort(() => Math.random() - 0.5).slice(0, 2);
 Store.data.codes[name] = { rewards: picks, usedBy: {} };
@@ -2169,7 +2280,7 @@ if (code.usedBy[p.auth]) return tell(p.id, "❌ Bạn đã nhập code này rồ
 code.usedBy[p.auth] = true;
 const e = econ(p.auth, p.name);
 let msg = "🎁 Bạn nhận: ";
-code.rewards.forEach(r => { r.apply(e); msg += r.label + ", "; });
+code.rewards.forEach(r => { applyReward(e, r); msg += r.label + ", "; });
 tell(p.id, msg.slice(0, -2), C.super, "bold");
 Store.touch(); Store.save();
 }
@@ -2326,8 +2437,7 @@ if (!p.role) return tell(p.id, "Bạn chưa đăng nhập.", C.warn);
 setRole(p, ROLE.USER); tell(p.id, "🔓 Đã đăng xuất.", C.ok);
 });
 
-def(["afk"], 0, "!afk", "Tự chuyển sang AFK", p => { if (p.afk) return tell(p.id, "Bạn đã AFK rồi.", C.warn); moveAfk(p, "Bạn đã bật AFK"); });
-
+def(["afk"], 0, "!afk", "Tự chuyển sang AFK", p => { if (p.afk) return tell(p.id, "Bạn đã AFK rồi.", C.warn);moveAfk(p, "Bạn đã bật AFK", "AFK_SELF"); });
 def(["back", "b"], 0, "!back", "Quay lại từ AFK", p => {
 if (!p.afk) return tell(p.id, "Bạn không AFK.", C.warn);
 p.afk = false; p.lastActive = Now(); syncQueue();
@@ -2610,7 +2720,7 @@ syncQueue(); scheduleBalance(); audit(`${p.name} MOVE ${t.name} → ${a[1]}`);
 
 def(["setafk"], 1, "!setafk <tên|#id>", "Ép sang AFK", (p, a) => {
 const t = resolve(p, a[0], { outrank: true }); if (!t) return;
-moveAfk(t, `${p.name} chuyển bạn sang AFK`);
+moveAfk(t, `${p.name} chuyển bạn sang AFK`, "AFK_ADMIN");
 });
 
 def(["swap"], 1, "!swap", "Đổi màu 2 đội", p => {
@@ -2980,10 +3090,7 @@ on("onPlayerLeave", pl => {
 const p = rec(pl.id);
 if (!p) return;
 
-if (running() && pl.team !== 0 && S.match && S.match.rated && !p.afk && Now() - (S.match.t0 || 0) > 30e3) {
-const s = stat(p.auth, p.name); s.leaves++; s.rating = Math.max(0, s.rating - 8); s.streak = 0; Store.touch();
-}
-
+if (pl.team !== 0 && !p.afk) eloLeavePenalty(pl.team, p, "QUIT");
 S.players.delete(pl.id); S.buffs.delete(pl.id);
 repPenalty(pl, p);
 S.gone.set(pl.id, { rec: p, t: Now() });
@@ -3026,7 +3133,8 @@ say(`${rankTag}${titleTag}${p.name}: ${msg}`, color, e.boldChat || ex ? "bold" :
 on("onPlayerActivity", pl => { const p = rec(pl.id); if (p) { p.lastActive = Now(); p.afkWarned = false; } });
 
 on("onPlayerBallKick", pl => {
-if (S.pen) return penKick(pl);                                                                       S.kickoffWaiting = false;
+if (S.pen) return penKick(pl);
+trackKick(pl);                                                                       S.kickoffWaiting = false;
 S.touches.push({ id: pl.id, team: pl.team, t: Now() });
 if (S.touches.length > 5) S.touches.shift();
 const p = rec(pl.id); if (p) p.lastActive = Now();
@@ -3092,7 +3200,9 @@ on("onGameStart", () => {
 if (S.pen) { penOnGameStart(); return; }
 if (guardGameStart()) return;
 S.otSaid = false;S.match = { t0: Now(), rated: S.mode !== "practice", pl: {}, warned30: false, bigGapAnnounced: false };
-S.touches = []; S.kickoffWaiting = true; S.kickoffTeam = 1;
+S.match.starters = {};
+for (const pl of list()) if (pl.team !== 0) S.match.starters[rec(pl.id).auth] = true;
+S.touches = [];S.kicks = []; S.kickoffWaiting = true; S.kickoffTeam = 1;
 S.paused = false;
 S.bets = { winner: {}, scorer: {} }; S.betsLocked = false;
 const t = Now(); for (const p of S.players.values()) { p.lastActive = t; p.afkWarned = false; }
@@ -3106,7 +3216,7 @@ say(pickRandom(MATCH_SLOGANS), C.super, "bold");
 });
 
 on("onPositionsReset", () => {
-if (S.pen) return;                                                                         S.kickoffWaiting = true; S.touches = [];
+if (S.pen) return;                                                                         S.kickoffWaiting = true; S.touches = [];S.kicks = [];
 reapplyBuffs();
 });
 
@@ -3583,10 +3693,11 @@ const mm = String(Math.floor(time / 60)).padStart(2, "0") + ":" + String(time % 
 
 if (last && t - last.t < 12e3 && rec(last.id)) {
 const shooter = rec(last.id), own = last.team !== team;
-const M = S.match, add = (p, k) => { if (!M) return; const x = M.pl[p.auth] || (M.pl[p.auth] = { name: p.name, g: 0, a: 0, og: 0 }); x[k]++; };
-
+const M = S.match, add = (p, k) => bump(p, k);
 if (own) {
 add(shooter, "og");
+const pv = S.touches[S.touches.length - 2];
+if (pv && pv.team === team && rec(pv.id) && last.t - pv.t < 6e3) add(rec(pv.id), "atog");
 say(`🤦 ${mm} — ${shooter.name} phản lưới nhà ${pickRandom(OWN_GOAL_HYPE)}`, C.warn, "bold", 1);
 ownGoalFx(shooter);
 } else {
@@ -3597,6 +3708,8 @@ if (a.team === team && a.id !== last.id && last.t - a.t < 6e3 && rec(a.id)) { as
 if (a.team !== team) break;
 }
 add(shooter, "g"); if (assist) add(assist, "a");
+const pv = S.touches[S.touches.length - 2];
+if (pv && pv.team !== team && pv.id !== last.id && rec(pv.id) && last.t - pv.t < 6e3) add(rec(pv.id), "err");
 say(`⚽ ${mm} — ${shooter.name} ghi bàn! ${pickRandom(GOAL_HYPE)}${assist ? " (kiến tạo: " + assist.name + ")" : ""}`, C.goal, "bold", 1);
 
 // 🎙️ BLV BÌNH LUẬN BÀN THẮNG
